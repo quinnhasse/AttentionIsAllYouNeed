@@ -1,0 +1,37 @@
+defaults:
+  - _self_
+  - experiment: base
+
+seed: 42
+device: auto
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  d_ff: 2048
+  max_len: 256
+  dropout: 0.1
+  use_pe: true
+
+training:
+  epochs: 20
+  batch_size: 128
+  warmup_steps: 4000
+  grad_clip: 1.0
+  label_smoothing: 0.1
+  use_warmup: true
+  save_dir: checkpoints
+  results_dir: results
+
+data:
+  src_lang: de
+  tgt_lang: en
+  vocab_size: 8000
+  max_seq_len: 100
+
+wandb:
+  enabled: false
+  project: attention-is-all-you-need
+  run_name: null
+  entity: null
