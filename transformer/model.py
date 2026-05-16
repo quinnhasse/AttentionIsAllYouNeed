@@ -16,6 +16,10 @@ class Transformer(nn.Module):
     Matches the architecture of Vaswani et al., 2017. The default
     hyperparameters correspond to the 'base' model from the paper:
     d_model=512, n_heads=8, n_layers=6, d_ff=2048, dropout=0.1.
+
+    The use_pe flag controls whether sinusoidal positional encoding is
+    applied to source and target embeddings. Set use_pe=False for the
+    ablation studying its contribution.
     """
 
     def __init__(
@@ -29,10 +33,12 @@ class Transformer(nn.Module):
         max_len: int = 512,
         dropout: float = 0.1,
         pad_idx: int = 0,
+        use_pe: bool = True,
     ) -> None:
         super().__init__()
         self.pad_idx = pad_idx
         self.d_model = d_model
+        self.use_pe = use_pe
 
         self.src_embed = TokenEmbedding(src_vocab_size, d_model)
         self.tgt_embed = TokenEmbedding(tgt_vocab_size, d_model)
@@ -74,6 +80,9 @@ class Transformer(nn.Module):
     def encode(self, src: Tensor, src_mask: Tensor | None = None) -> Tensor:
         """Run encoder on source tokens.
 
+        Applies token embedding, optionally adds positional encoding,
+        then passes through the encoder stack.
+
         Args:
             src: Token ids, shape (batch, src_len).
             src_mask: Optional padding mask.
@@ -81,7 +90,10 @@ class Transformer(nn.Module):
         Returns:
             Encoder output, shape (batch, src_len, d_model).
         """
-        return self.encoder(self.pos_enc(self.src_embed(src)), src_mask)
+        x = self.src_embed(src)
+        if self.use_pe:
+            x = self.pos_enc(x)
+        return self.encoder(x, src_mask)
 
     def decode(
         self,
@@ -92,6 +104,9 @@ class Transformer(nn.Module):
     ) -> Tensor:
         """Run decoder on target tokens given encoder memory.
 
+        Applies token embedding, optionally adds positional encoding,
+        then passes through the decoder stack.
+
         Args:
             tgt: Target token ids, shape (batch, tgt_len).
             memory: Encoder output, shape (batch, src_len, d_model).
@@ -101,7 +116,10 @@ class Transformer(nn.Module):
         Returns:
             Decoder output, shape (batch, tgt_len, d_model).
         """
-        return self.decoder(self.pos_enc(self.tgt_embed(tgt)), memory, tgt_mask, src_mask)
+        x = self.tgt_embed(tgt)
+        if self.use_pe:
+            x = self.pos_enc(x)
+        return self.decoder(x, memory, tgt_mask, src_mask)
 
     def forward(self, src: Tensor, tgt: Tensor) -> Tensor:
         """Full forward pass: encode source, decode target, project to vocab.
@@ -176,9 +194,6 @@ class TransformerLM(nn.Module):
         self.embed = TokenEmbedding(vocab_size, d_model)
         self.pos_enc = PositionalEncoding(d_model, max_len, dropout)
 
-        # We use the Encoder stack for the LM (self-attention only, no cross-attn needed)
-        # But we need causal masking, so we use the Decoder with memory=x trick.
-        # Simpler: implement a dedicated causal encoder stack.
         self.layers = nn.ModuleList(
             [_CausalEncoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
         )
