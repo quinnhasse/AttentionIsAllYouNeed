@@ -1,48 +1,62 @@
-"""Train TransformerLM on WikiText-2 with gradient clipping and optional W&B logging.
+"""Train Transformer (enc-dec) on Multi30k DE→EN with Hydra configs and W&B logging.
 
 Usage:
-    python train.py
-    python train.py --d_model 256 --n_heads 8 --n_layers 4 --epochs 30
-    python train.py --wandb  # requires WANDB_API_KEY env var
+    python train.py                          # base config
+    python train.py +experiment=base         # explicit base experiment
+    python train.py +experiment=no_pe        # ablation: no positional encoding
+    python train.py +experiment=no_label_smooth
+    python train.py +experiment=no_warmup
+
+Override individual params:
+    python train.py training.epochs=30 training.batch_size=64
+    python train.py wandb.enabled=true wandb.run_name=my-run
+
+All outputs go under outputs/<date>/<time>/ (Hydra default).
 """
 
-import argparse
+from __future__ import annotations
+
 import json
 import math
 import os
 import time
 from pathlib import Path
 
+import hydra
 import torch
 import torch.nn as nn
+from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
 from tqdm import tqdm
 
-from transformer.model import TransformerLM
+from transformer.model import Transformer
 from transformer.scheduler import get_noam_scheduler
-from data.dataset import get_dataloaders
+from data.translation import get_translation_dataloaders, BOS_IDX, EOS_IDX, PAD_IDX
 
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
 
 def label_smoothed_ce(
     logits: Tensor,
     targets: Tensor,
     smoothing: float = 0.1,
-    pad_idx: int = 0,
+    pad_idx: int = PAD_IDX,
 ) -> Tensor:
-    """Cross-entropy with label smoothing.
+    """Cross-entropy with label smoothing over non-pad tokens.
 
     Distributes `smoothing` probability mass uniformly across the
-    vocabulary, reserving `1 - smoothing` for the correct label.
-    Pad tokens are excluded from the loss.
+    vocabulary and reserves `1 - smoothing` for the correct label.
 
     Args:
-        logits: (batch * seq_len, vocab_size)
-        targets: (batch * seq_len,)
-        smoothing: Label smoothing epsilon.
-        pad_idx: Token id of the padding token.
+        logits: (N, vocab_size) where N = batch * seq_len.
+        targets: (N,) token ids.
+        smoothing: Label smoothing epsilon (0.0 = standard CE).
+        pad_idx: Token id to exclude from loss.
 
     Returns:
-        Scalar loss tensor.
+        Scalar mean loss over non-pad tokens.
     """
     vocab_size = logits.size(-1)
     log_probs = torch.log_softmax(logits, dim=-1)
@@ -59,90 +73,165 @@ def label_smoothed_ce(
     return loss.sum() / n_tokens.clamp(min=1)
 
 
+# ---------------------------------------------------------------------------
+# Evaluation (greedy BLEU)
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
-def evaluate(model: TransformerLM, loader, device: torch.device) -> float:
+def evaluate_bleu(
+    model: Transformer,
+    loader,
+    tgt_tokenizer,
+    device: torch.device,
+    max_gen_len: int = 100,
+) -> float:
+    """Compute corpus BLEU on a dataloader using greedy decoding.
+
+    Args:
+        model: Trained Transformer in eval mode.
+        loader: DataLoader yielding (src_ids, tgt_ids).
+        tgt_tokenizer: Target-side tokenizer for decoding ids to strings.
+        device: Device for inference.
+        max_gen_len: Maximum generated tokens per example.
+
+    Returns:
+        Corpus BLEU score (0–100).
+    """
+    try:
+        import sacrebleu
+    except ImportError:
+        return 0.0
+
+    model.eval()
+    hypotheses: list[str] = []
+    references: list[str] = []
+
+    for src, tgt in loader:
+        src = src.to(device)
+        for i in range(src.size(0)):
+            src_i = src[i].unsqueeze(0)  # (1, src_len)
+            gen = model.greedy_decode(src_i, BOS_IDX, EOS_IDX, max_len=max_gen_len)
+            hyp_ids = gen[0].tolist()
+            hyp = tgt_tokenizer.decode(hyp_ids)
+            hypotheses.append(hyp)
+
+            ref_ids = tgt[i].tolist()
+            ref_ids = [t for t in ref_ids if t not in (PAD_IDX, BOS_IDX, EOS_IDX)]
+            ref = tgt_tokenizer.decode(ref_ids)
+            references.append(ref)
+
+    bleu = sacrebleu.corpus_bleu(hypotheses, [references])
+    return bleu.score
+
+
+@torch.no_grad()
+def evaluate_loss(
+    model: Transformer,
+    loader,
+    device: torch.device,
+    pad_idx: int = PAD_IDX,
+) -> float:
     """Compute token-level cross-entropy (no label smoothing) on a split.
 
     Args:
-        model: TransformerLM in eval mode.
-        loader: DataLoader yielding (input, target) batches.
-        device: Device to run on.
+        model: Transformer in eval mode.
+        loader: DataLoader yielding (src_ids, tgt_ids).
+        device: Inference device.
+        pad_idx: Token id to exclude from loss calculation.
 
     Returns:
-        Mean cross-entropy (nats per token).
+        Mean cross-entropy in nats per non-pad token.
     """
     model.eval()
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
     total_loss = 0.0
     total_tokens = 0
 
     for src, tgt in loader:
         src, tgt = src.to(device), tgt.to(device)
-        logits = model(src)
+        # Teacher-forced: feed tgt[:-1] as input, predict tgt[1:]
+        tgt_input = tgt[:, :-1]
+        tgt_target = tgt[:, 1:]
+
+        logits = model(src, tgt_input)  # (B, T-1, vocab)
         B, T, V = logits.shape
-        loss = criterion(logits.view(B * T, V), tgt.view(B * T))
-        n_tokens = (tgt != 0).sum().item()
+        loss = criterion(logits.reshape(B * T, V), tgt_target.reshape(B * T))
+        n_tokens = (tgt_target != pad_idx).sum().item()
         total_loss += loss.item() * n_tokens
         total_tokens += n_tokens
 
     return total_loss / max(total_tokens, 1)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train TransformerLM on WikiText-2")
-    p.add_argument("--d_model", type=int, default=256)
-    p.add_argument("--n_heads", type=int, default=8)
-    p.add_argument("--n_layers", type=int, default=4)
-    p.add_argument("--d_ff", type=int, default=1024)
-    p.add_argument("--max_len", type=int, default=256)
-    p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--vocab_size", type=int, default=8000)
-    p.add_argument("--seq_len", type=int, default=128)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--warmup_steps", type=int, default=4000)
-    p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="auto")
-    p.add_argument("--save_dir", type=str, default="checkpoints")
-    p.add_argument("--results_dir", type=str, default="results")
-    p.add_argument("--wandb", action="store_true", help="Log to W&B (requires WANDB_API_KEY)")
-    p.add_argument("--wandb_project", type=str, default="attention-is-all-you-need")
-    return p.parse_args()
+# ---------------------------------------------------------------------------
+# Gradient norm helper
+# ---------------------------------------------------------------------------
+
+def _grad_norm(model: nn.Module) -> float:
+    """Compute the global L2 norm of all gradients.
+
+    Args:
+        model: Model with gradients populated after backward().
+
+    Returns:
+        Global gradient L2 norm as a Python float.
+    """
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().norm(2).item() ** 2
+    return math.sqrt(total)
 
 
-def main() -> None:
-    args = parse_args()
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    torch.manual_seed(args.seed)
+@hydra.main(config_path="conf", config_name="config", version_base=None)
+def main(cfg: DictConfig) -> None:
+    """Train Transformer on Multi30k using Hydra config.
 
-    if args.device == "auto":
+    Args:
+        cfg: Merged Hydra config (config.yaml + experiment override).
+    """
+    print(OmegaConf.to_yaml(cfg))
+
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    if cfg.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
-        device = torch.device(args.device)
-
+        device = torch.device(cfg.device)
     print(f"device: {device}")
 
     # Data
-    print("loading WikiText-2 ...")
-    train_loader, val_loader, test_loader, tokenizer = get_dataloaders(
-        batch_size=args.batch_size,
-        seq_len=args.seq_len,
-        vocab_size=args.vocab_size,
-        seed=args.seed,
+    print("loading Multi30k ...")
+    train_loader, val_loader, test_loader, src_tok, tgt_tok = get_translation_dataloaders(
+        src_lang=cfg.data.src_lang,
+        tgt_lang=cfg.data.tgt_lang,
+        vocab_size=cfg.data.vocab_size,
+        batch_size=cfg.training.batch_size,
+        max_seq_len=cfg.data.max_seq_len,
+        seed=cfg.seed,
     )
-    vocab_size = tokenizer.get_vocab_size()
-    print(f"vocab size: {vocab_size}")
+    src_vocab = src_tok.get_vocab_size()
+    tgt_vocab = tgt_tok.get_vocab_size()
+    print(f"src vocab: {src_vocab}  tgt vocab: {tgt_vocab}")
 
     # Model
-    model = TransformerLM(
-        vocab_size=vocab_size,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        d_ff=args.d_ff,
-        max_len=args.max_len,
-        dropout=args.dropout,
+    model = Transformer(
+        src_vocab_size=src_vocab,
+        tgt_vocab_size=tgt_vocab,
+        d_model=cfg.model.d_model,
+        n_heads=cfg.model.n_heads,
+        n_layers=cfg.model.n_layers,
+        d_ff=cfg.model.d_ff,
+        max_len=cfg.model.max_len,
+        dropout=cfg.model.dropout,
+        pad_idx=PAD_IDX,
+        use_pe=cfg.model.use_pe,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -152,32 +241,47 @@ def main() -> None:
     optimizer = torch.optim.Adam(
         model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9
     )
-    scheduler = get_noam_scheduler(optimizer, d_model=args.d_model, warmup_steps=args.warmup_steps)
+    if cfg.training.use_warmup:
+        scheduler = get_noam_scheduler(
+            optimizer,
+            d_model=cfg.model.d_model,
+            warmup_steps=cfg.training.warmup_steps,
+        )
+    else:
+        # Constant lr schedule: lrate = d_model^{-0.5} * warmup_steps^{-0.5}
+        peak = cfg.model.d_model ** -0.5 * cfg.training.warmup_steps ** -0.5
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=peak)
 
     # W&B (optional)
     wb_run = None
-    if args.wandb:
+    if cfg.wandb.enabled:
         try:
             import wandb
+            run_name = cfg.wandb.run_name or (
+                f"d{cfg.model.d_model}-h{cfg.model.n_heads}"
+                f"-pe{cfg.model.use_pe}-ls{cfg.training.label_smoothing}"
+                f"-wu{cfg.training.use_warmup}"
+            )
             wb_run = wandb.init(
-                project=args.wandb_project,
-                config=vars(args),
-                name=f"lm-d{args.d_model}-h{args.n_heads}-l{args.n_layers}",
+                project=cfg.wandb.project,
+                entity=cfg.wandb.entity or None,
+                name=run_name,
+                config=OmegaConf.to_container(cfg, resolve=True),
             )
         except Exception as exc:
-            print(f"W&B init failed: {exc}. Continuing without W&B.")
+            print(f"W&B init failed: {exc}")
 
-    # Directories
-    save_dir = Path(args.save_dir)
+    # Output dirs (Hydra sets cwd to outputs/<date>/<time>)
+    save_dir = Path(cfg.training.save_dir)
+    results_dir = Path(cfg.training.results_dir)
     save_dir.mkdir(exist_ok=True)
-    results_dir = Path(args.results_dir)
     results_dir.mkdir(exist_ok=True)
 
     log: list[dict] = []
     best_val_loss = float("inf")
     step = 0
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, cfg.training.epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_tokens = 0
@@ -185,78 +289,110 @@ def main() -> None:
 
         for src, tgt in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
             src, tgt = src.to(device), tgt.to(device)
+            tgt_input  = tgt[:, :-1]
+            tgt_target = tgt[:, 1:]
 
             optimizer.zero_grad()
-            logits = model(src)
+            logits = model(src, tgt_input)
             B, T, V = logits.shape
-            loss = label_smoothed_ce(logits.view(B * T, V), tgt.view(B * T))
+            loss = label_smoothed_ce(
+                logits.reshape(B * T, V),
+                tgt_target.reshape(B * T),
+                smoothing=cfg.training.label_smoothing,
+            )
             loss.backward()
 
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            gnorm = _grad_norm(model)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
             optimizer.step()
             scheduler.step()
             step += 1
 
-            n_tokens = (tgt != 0).sum().item()
+            n_tokens = (tgt_target != PAD_IDX).sum().item()
             epoch_loss += loss.item() * n_tokens
             epoch_tokens += n_tokens
 
+            if wb_run and step % 100 == 0:
+                wb_run.log({
+                    "train/loss_step": loss.item(),
+                    "train/grad_norm": gnorm,
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "step": step,
+                })
+
         train_loss = epoch_loss / max(epoch_tokens, 1)
-        val_loss = evaluate(model, val_loader, device)
-        val_ppl = math.exp(val_loss)
+        val_loss = evaluate_loss(model, val_loader, device)
+
+        # BLEU on validation set every 5 epochs (expensive: greedy decode)
+        val_bleu = 0.0
+        if epoch % 5 == 0 or epoch == cfg.training.epochs:
+            val_bleu = evaluate_bleu(model, val_loader, tgt_tok, device)
+
         elapsed = time.time() - t0
+        lr_now = scheduler.get_last_lr()[0]
 
         entry = {
             "epoch": epoch,
             "train_loss": round(train_loss, 4),
             "val_loss": round(val_loss, 4),
-            "val_perplexity": round(val_ppl, 2),
-            "lr": scheduler.get_last_lr()[0],
+            "val_bleu": round(val_bleu, 2),
+            "lr": lr_now,
+            "grad_norm": round(gnorm, 4),
             "elapsed_s": round(elapsed, 1),
         }
         log.append(entry)
         print(
-            f"epoch {epoch:>3} | train {train_loss:.4f} | val {val_loss:.4f} "
-            f"| ppl {val_ppl:.1f} | {elapsed:.1f}s"
+            f"epoch {epoch:>3} | train {train_loss:.4f} | val {val_loss:.4f}"
+            f" | bleu {val_bleu:.1f} | lr {lr_now:.2e} | gnorm {gnorm:.2f}"
+            f" | {elapsed:.1f}s"
         )
 
         if wb_run:
-            wb_run.log(entry)
+            wb_run.log({
+                "train/loss_epoch": train_loss,
+                "val/loss": val_loss,
+                "val/bleu": val_bleu,
+                "train/lr": lr_now,
+                "epoch": epoch,
+            })
 
-        # Checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(
-                {"epoch": epoch, "model": model.state_dict(), "args": vars(args)},
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "cfg": OmegaConf.to_container(cfg, resolve=True),
+                    "val_bleu": val_bleu,
+                },
                 save_dir / "best.pt",
             )
 
-        # Save log after every epoch
         with open(results_dir / "training_log.json", "w") as f:
             json.dump(log, f, indent=2)
 
-    # Final test evaluation
-    best_ckpt = torch.load(save_dir / "best.pt", map_location=device)
-    model.load_state_dict(best_ckpt["model"])
-    test_loss = evaluate(model, test_loader, device)
-    test_ppl = math.exp(test_loss)
+    # Final test BLEU from best checkpoint
+    ckpt = torch.load(save_dir / "best.pt", map_location=device)
+    model.load_state_dict(ckpt["model"])
+    test_loss = evaluate_loss(model, test_loader, device)
+    test_bleu = evaluate_bleu(model, test_loader, tgt_tok, device)
 
     summary = {
         "best_val_loss": round(best_val_loss, 4),
-        "best_val_perplexity": round(math.exp(best_val_loss), 2),
         "test_loss": round(test_loss, 4),
-        "test_perplexity": round(test_ppl, 2),
+        "test_bleu": round(test_bleu, 2),
         "n_params": n_params,
-        "epochs": args.epochs,
+        "epochs": cfg.training.epochs,
+        "config": OmegaConf.to_container(cfg, resolve=True),
     }
-    print(f"\nbest val ppl:  {math.exp(best_val_loss):.1f}")
-    print(f"test ppl:      {test_ppl:.1f}")
+    print(f"\nbest val loss: {best_val_loss:.4f}")
+    print(f"test BLEU:     {test_bleu:.2f}")
 
     with open(results_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     if wb_run:
-        wb_run.summary.update(summary)
+        wb_run.summary.update({"test/bleu": test_bleu, "test/loss": test_loss})
         wb_run.finish()
 
 
