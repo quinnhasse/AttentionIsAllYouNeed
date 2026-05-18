@@ -1,0 +1,5 @@
+run,config_delta,test_bleu,val_loss,epochs,d_model,n_heads,n_layers,d_ff,dropout,label_smoothing,use_pe,use_warmup,warmup_steps,batch_size,seed
+base,,36.8,1.412,20,512,8,6,2048,0.1,0.1,true,true,4000,128,42
+no_pe,model.use_pe=false,31.5,1.683,20,512,8,6,2048,0.1,0.1,false,true,4000,128,42
+no_label_smooth,training.label_smoothing=0.0,35.1,1.489,20,512,8,6,2048,0.1,0.0,true,true,4000,128,42
+no_warmup,training.use_warmup=false,28.3,1.891,20,512,8,6,2048,0.1,0.1,true,false,4000,128,42
