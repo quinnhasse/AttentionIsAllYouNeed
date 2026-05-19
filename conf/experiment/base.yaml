@@ -1,0 +1,25 @@
+# @package _global_
+# Base experiment: all defaults from conf/config.yaml.
+# Run with: python train.py +experiment=base
+
+# No overrides — this experiment uses the config.yaml defaults exactly.
+# Explicitly listing them here for documentation clarity.
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_layers: 6
+  d_ff: 2048
+  dropout: 0.1
+  use_pe: true
+
+training:
+  epochs: 20
+  batch_size: 128
+  warmup_steps: 4000
+  grad_clip: 1.0
+  label_smoothing: 0.1
+  use_warmup: true
+
+wandb:
+  run_name: base
