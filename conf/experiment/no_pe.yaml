@@ -1,0 +1,9 @@
+# @package _global_
+# Ablation: no positional encoding.
+# Run with: python train.py +experiment=no_pe
+
+model:
+  use_pe: false
+
+wandb:
+  run_name: no_pe
